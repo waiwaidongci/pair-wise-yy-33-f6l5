@@ -10,6 +10,7 @@ class GridFlowTest(unittest.TestCase):
         self.sub = self.s.register_asset("dispatcher", "dispatcher", "SUB", "中心站", "substation", 200, "A")
         self.line = self.s.register_asset("dispatcher", "dispatcher", "LINE", "线路", "line", 100, "A", self.sub["id"])
         self.s.register_facility("dispatcher", "dispatcher", "医院", "hospital", self.sub["id"], 1, 50)
+        self.gen = self.s.register_power_source("dispatcher", "dispatcher", "GEN", "移动发电车", "mobile_generator", 100, "A", "王队 13800000001", "应急中心")
 
     def tearDown(self): self.s.store.close(); self.tmp.cleanup()
 
@@ -24,6 +25,11 @@ class GridFlowTest(unittest.TestCase):
 
     def test_full_restore_offline_merge_duplicate_and_plan_change(self):
         outage, plan = self.plan()
+        self.s.assign_power("dispatcher", "dispatcher", plan["id"], 1, "GEN", "王队 13800000001",
+                            "2026-09-25T08:00:00Z", "2026-09-25T10:00:00Z", 2, plan["resource_revision"])
+        plan = self.s.plan_detail(plan["id"])["plan"]
+        self.s.assign_power("dispatcher", "dispatcher", plan["id"], 2, "GEN", "王队 13800000001",
+                            "2026-09-25T10:00:00Z", "2026-09-25T12:00:00Z", 2, plan["resource_revision"])
         report = self.s.field_report("field", "field", plan["id"], 1, "client-1", plan["version"], "completed", "设备已检查")
         self.assertEqual("merged", report["merge_status"])
         confirmed = self.s.confirm_step("dispatcher", "dispatcher", plan["id"], 1, "confirmed", "现场照片核验")
