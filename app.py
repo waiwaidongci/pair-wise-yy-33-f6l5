@@ -23,8 +23,8 @@ def j(value: object) -> str:
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message); self.status, self.message = status, message
+    def __init__(self, status: int, message: str, details: dict | None = None):
+        super().__init__(message); self.status, self.message, self.details = status, message, details
 
 
 class Store:
@@ -76,6 +76,21 @@ class Store:
         CREATE TABLE IF NOT EXISTS published_status (
           id INTEGER PRIMARY KEY AUTOINCREMENT, outage_id INTEGER NOT NULL REFERENCES outages(id),
           plan_id INTEGER NOT NULL REFERENCES plans(id), version INTEGER NOT NULL, status_json TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS power_resources (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+          resource_type TEXT NOT NULL, capacity_mw REAL NOT NULL, owner TEXT NOT NULL,
+          region TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'available'
+            CHECK(status IN ('available','retired')), registered_by TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS resource_assignments (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES plans(id), step_no INTEGER NOT NULL,
+          resource_id INTEGER NOT NULL REFERENCES power_resources(id), contact_name TEXT NOT NULL,
+          contact_phone TEXT, available_from TEXT NOT NULL, available_to TEXT NOT NULL,
+          priority INTEGER NOT NULL CHECK(priority BETWEEN 1 AND 3),
+          state TEXT NOT NULL DEFAULT 'allocated' CHECK(state IN ('allocated','displaced')),
+          occupied_by_plan_id INTEGER, occupied_by_step_no INTEGER,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(plan_id,step_no)
         );
         CREATE TABLE IF NOT EXISTS audit_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
@@ -209,7 +224,10 @@ class GridService:
                                     (outage["id"], version, j(normalized), actor, now()))
             self.conn.execute("UPDATE plans SET state='superseded' WHERE id=?", (base_plan_id,))
             self._copy_confirmations(base_plan_id, cur.lastrowid, normalized, confirmed)
+            self._copy_assignments(base_plan_id, cur.lastrowid, normalized)
             self.store.audit(actor, "plan.change_create", "plan", cur.lastrowid, {"base_plan": base_plan_id, "version": version, "carried_confirmations": len(confirmed)})
+            for row in self.conn.execute("SELECT DISTINCT resource_id FROM resource_assignments WHERE plan_id=?", (cur.lastrowid,)):
+                self._recompute_resource(int(row["resource_id"]))
         return self._plan_dict(self._row("plans", cur.lastrowid))
 
     def field_report(self, actor: str | None, role: str | None, plan_id: int, step_no: int, client_report_id: str, expected_plan_version: int, status: str, note: str = "") -> dict:
@@ -252,16 +270,163 @@ class GridService:
             self.store.audit(actor, "plan.confirm_step", "plan", plan_id, {"step_no": step_no, "status": decision, "note": note})
         return dict(self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? AND step_no=?", (plan_id, step_no)).fetchone())
 
+    def register_power_resource(self, actor: str | None, role: str | None, code: str, name: str, resource_type: str,
+                                capacity_mw: float, owner: str, region: str, contact: str = "", contact_phone: str = "") -> dict:
+        actor = self._actor(actor, role, {"dispatcher"})
+        if not code.strip() or not name.strip() or not region.strip(): raise ApiError(400, "电源代号、名称和区域不能为空")
+        if capacity_mw <= 0: raise ApiError(400, "电源容量必须为正")
+        try:
+            with self.conn:
+                cur = self.conn.execute("""INSERT INTO power_resources(code,name,resource_type,capacity_mw,owner,region,registered_by,created_at)
+                                         VALUES(?,?,?,?,?,?,?,?)""",
+                                        (code, name, resource_type or "generator", float(capacity_mw), owner, region, actor, now()))
+                self.store.audit(actor, "resource.register", "power_resource", cur.lastrowid,
+                                 {"code": code, "capacity_mw": capacity_mw, "region": region})
+        except sqlite3.IntegrityError as exc: raise ApiError(409, "电源代号已存在") from exc
+        return self._power_resource_dict(self._row("power_resources", cur.lastrowid))
+
+    def assign_resource(self, actor: str | None, role: str | None, plan_id: int, step_no: int, resource_id: int,
+                        contact_name: str, available_from: str, available_to: str, priority: int,
+                        expected_revision: int, contact_phone: str = "") -> dict:
+        actor = self._actor(actor, role, {"dispatcher"})
+        plan = self._row("plans", plan_id)
+        if plan["state"] == "superseded": raise ApiError(409, "计划已被新版本替代，不能再排定资源")
+        if int(expected_revision) < 0 or int(expected_revision) != int(plan["revision"]):
+            raise ApiError(409, "计划版本已变化，请重新加载后再保存", {"current_revision": plan["revision"]})
+        steps = {int(x["seq"]): x for x in json.loads(plan["steps_json"])}
+        if step_no not in steps: raise ApiError(400, "计划中没有该步骤")
+        if self.conn.execute("SELECT id FROM confirmations WHERE plan_id=? AND step_no=?", (plan_id, step_no)).fetchone():
+            raise ApiError(409, f"步骤 {step_no} 已确认，不能换电", {"protected_step": step_no})
+        resource = self._row("power_resources", resource_id)
+        if resource["status"] != "available": raise ApiError(409, "该电源已停用，不能排定")
+        if not str(contact_name).strip(): raise ApiError(400, "联系人不能为空")
+        if int(priority) not in {1, 2, 3}: raise ApiError(400, "优先级必须为 1（高）、2（中）或 3（低）")
+        win_from = self._parse_ts(available_from, "可用开始时间")
+        win_to = self._parse_ts(available_to, "可用结束时间")
+        if win_to <= win_from: raise ApiError(400, "可用结束时间必须晚于开始时间")
+        required_mw = float(steps[step_no]["required_mw"])
+        if required_mw > float(resource["capacity_mw"]):
+            raise ApiError(400, f"电源容量 {resource['capacity_mw']}MW 不足以支撑步骤需求 {required_mw}MW",
+                           {"required_mw": required_mw, "capacity_mw": resource["capacity_mw"]})
+        with self.conn:
+            existing = self.conn.execute("SELECT * FROM resource_assignments WHERE plan_id=? AND step_no=?", (plan_id, step_no)).fetchone()
+            if existing:
+                old_resource_id = int(existing["resource_id"])
+                self.conn.execute("""UPDATE resource_assignments SET resource_id=?,contact_name=?,contact_phone=?,available_from=?,
+                                   available_to=?,priority=?,state='allocated',occupied_by_plan_id=NULL,occupied_by_step_no=NULL,updated_at=?
+                                   WHERE id=?""",
+                                  (resource_id, contact_name, contact_phone, self._fmt_ts(win_from), self._fmt_ts(win_to),
+                                   int(priority), now(), existing["id"]))
+                assignment_id = existing["id"]
+            else:
+                cur = self.conn.execute("""INSERT INTO resource_assignments(plan_id,step_no,resource_id,contact_name,contact_phone,
+                                       available_from,available_to,priority,state,created_at,updated_at)
+                                       VALUES(?,?,?,?,?,?,?,?,'allocated',?,?)""",
+                                        (plan_id, step_no, resource_id, contact_name, contact_phone,
+                                         self._fmt_ts(win_from), self._fmt_ts(win_to), int(priority), now(), now()))
+                assignment_id = cur.lastrowid
+                old_resource_id = None
+            self._recompute_resource(resource_id)
+            if old_resource_id is not None and old_resource_id != resource_id: self._recompute_resource(old_resource_id)
+            updated = self.conn.execute("UPDATE plans SET revision=revision+1 WHERE id=? AND revision=?",
+                                        (plan_id, int(expected_revision)))
+            if updated.rowcount != 1: raise ApiError(409, "计划版本冲突，请重新加载", {"current_revision": self._row("plans", plan_id)["revision"]})
+            self.store.audit(actor, "resource.assign", "plan", plan_id,
+                             {"step_no": step_no, "resource_id": resource_id, "priority": int(priority)})
+        return {"assignment": self._assignment_dict(self._row("resource_assignments", assignment_id)),
+                "plan_revision": self._row("plans", plan_id)["revision"]}
+
+    def _recompute_resource(self, resource_id: int) -> None:
+        """对同一电源的全部排定按 已确认锁定 > 优先级 > 先排定 重新仲裁，败者标记为被占用。"""
+        rows = [dict(row) for row in self.conn.execute("""SELECT a.* FROM resource_assignments a JOIN plans p ON a.plan_id=p.id
+                                                         WHERE a.resource_id=? AND p.state!='superseded' ORDER BY a.id""", (resource_id,))]
+        def key(row: dict) -> tuple:
+            protected = 0 if self.conn.execute("SELECT id FROM confirmations WHERE plan_id=? AND step_no=?",
+                                               (row["plan_id"], row["step_no"])).fetchone() else 1
+            return (protected, int(row["priority"]), int(row["id"]))
+        rows.sort(key=key)
+        holders: list[dict] = []
+        for row in rows:
+            a_from, a_to = self._parse_ts(row["available_from"], ""), self._parse_ts(row["available_to"], "")
+            occupier = None
+            for kept in holders:
+                k_from, k_to = self._parse_ts(kept["available_from"], ""), self._parse_ts(kept["available_to"], "")
+                if a_from < k_to and k_from < a_to: occupier = kept; break
+            if occupier is None:
+                self.conn.execute("UPDATE resource_assignments SET state='allocated',occupied_by_plan_id=NULL,occupied_by_step_no=NULL,updated_at=? WHERE id=?",
+                                  (now(), row["id"]))
+                holders.append(row)
+            else:
+                self.conn.execute("UPDATE resource_assignments SET state='displaced',occupied_by_plan_id=?,occupied_by_step_no=?,updated_at=? WHERE id=?",
+                                  (occupier["plan_id"], occupier["step_no"], now(), row["id"]))
+
+    def resource_readiness(self, outage_id: int, plan_id: int | None = None) -> dict:
+        outage = self._row("outages", outage_id)
+        regions = json.loads(outage["affected_regions_json"])
+        if plan_id is None:
+            row = self.conn.execute("SELECT * FROM plans WHERE outage_id=? ORDER BY version DESC LIMIT 1", (outage_id,)).fetchone()
+            if row is None: return {"outage_id": outage_id, "plan_id": None, "ready": False,
+                                    "regions": [{"region": region, "ready": False, "block_reasons": ["该区域尚无恢复计划步骤"]} for region in regions]}
+            plan = row
+        else:
+            plan = self._row("plans", plan_id)
+            if plan["outage_id"] != outage_id: raise ApiError(400, "计划不属于该事故")
+        steps = json.loads(plan["steps_json"])
+        assets = {row["code"]: dict(row) for row in self.conn.execute("SELECT * FROM assets")}
+        assignments = {(int(row["plan_id"]), int(row["step_no"])): dict(row)
+                       for row in self.conn.execute("SELECT * FROM resource_assignments WHERE plan_id=?", (plan["id"],))}
+        resources = {int(row["id"]): dict(row) for row in self.conn.execute("SELECT * FROM power_resources")}
+        grouped: dict[str, list[dict]] = {region: [] for region in regions}
+        for step in steps:
+            region = assets.get(step["asset"], {}).get("region", "未登记区域")
+            grouped.setdefault(region, [])
+            entry = {"seq": int(step["seq"]), "asset": step["asset"], "required_mw": float(step["required_mw"]),
+                     "ready": False, "block_reasons": []}
+            assignment = assignments.get((int(plan["id"]), entry["seq"]))
+            if assignment is None:
+                entry["block_reasons"].append("步骤未指定备用电源")
+            else:
+                resource = resources.get(int(assignment["resource_id"]))
+                if resource is None:
+                    entry["block_reasons"].append("指定电源已注销")
+                elif resource["status"] != "available":
+                    entry["block_reasons"].append(f"电源 {resource['code']} 已停用")
+                elif entry["required_mw"] > float(resource["capacity_mw"]):
+                    entry["block_reasons"].append(f"电源 {resource['code']} 容量 {resource['capacity_mw']}MW 不足（需 {entry['required_mw']}MW）")
+                if assignment["state"] == "displaced":
+                    occ_plan, occ_step = assignment["occupied_by_plan_id"], assignment["occupied_by_step_no"]
+                    entry["block_reasons"].append(f"电源时段被计划#{occ_plan}步骤{occ_step}占用")
+                win_from, win_to = self._parse_ts(assignment["available_from"], ""), self._parse_ts(assignment["available_to"], "")
+                moment = datetime.now(timezone.utc)
+                if not (win_from <= moment <= win_to):
+                    entry["block_reasons"].append(f"当前不在电源可用时段内（{assignment['available_from']} ~ {assignment['available_to']}）")
+            entry["ready"] = not entry["block_reasons"]
+            grouped[region].append(entry)
+        region_summaries = []
+        for region in regions:
+            entries = grouped.get(region, [])
+            reasons = [f"步骤 {e['seq']}：{reason}" for e in entries for reason in e["block_reasons"]]
+            if not entries: reasons = ["该区域尚无恢复计划步骤"]
+            region_summaries.append({"region": region, "ready": not reasons, "steps": entries, "block_reasons": reasons})
+        return {"outage_id": outage_id, "plan_id": plan["id"], "plan_version": plan["version"], "plan_state": plan["state"],
+                "ready": all(item["ready"] for item in region_summaries), "regions": region_summaries}
+
     def publish_status(self, actor: str | None, role: str | None, outage_id: int, plan_id: int) -> dict:
         actor = self._actor(actor, role, {"dispatcher"})
         plan = self._row("plans", plan_id); outage = self._row("outages", outage_id)
         if plan["outage_id"] != outage_id: raise ApiError(400, "计划不属于该事故")
+        readiness = self.resource_readiness(outage_id, plan_id)
+        if not readiness["ready"]:
+            blockers = [{"region": item["region"], "reasons": item["block_reasons"]}
+                        for item in readiness["regions"] if not item["ready"]]
+            raise ApiError(409, "备用电源尚未齐备，不能发布恢复完成状态", {"blocked_regions": blockers})
         confirmations = {row["step_no"]: dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=?", (plan_id,))}
         steps = json.loads(plan["steps_json"])
         completed = sum(1 for step in steps if confirmations.get(int(step["seq"]), {}).get("status") == "confirmed")
         status = {"outage_id": outage_id, "incident_code": outage["incident_code"], "plan_id": plan_id, "plan_version": plan["version"],
                   "state": "restored" if completed == len(steps) else "restoring", "completed_steps": completed, "total_steps": len(steps),
-                  "critical_blocked": [x for x in confirmations.values() if x["status"] == "blocked"]}
+                  "critical_blocked": [x for x in confirmations.values() if x["status"] == "blocked"],
+                  "resource_ready": True, "resource_regions": readiness["regions"]}
         with self.conn:
             cur = self.conn.execute("INSERT INTO published_status(outage_id,plan_id,version,status_json,created_at) VALUES(?,?,?,?,?)",
                                     (outage_id, plan_id, plan["version"], j(status), now()))
@@ -309,9 +474,89 @@ class GridService:
             if cur.rowcount != 1: raise ApiError(409, "并发计划更新冲突")
             self.store.audit(actor, action, "plan", plan["id"], details)
 
+    def _copy_assignments(self, old_plan_id: int, new_plan_id: int, steps: list[dict]) -> int:
+        kept_seqs = {int(step["seq"]) for step in steps}
+        rows = self.conn.execute("SELECT * FROM resource_assignments WHERE plan_id=? AND state='allocated'", (old_plan_id,)).fetchall()
+        count = 0
+        for row in rows:
+            if int(row["step_no"]) not in kept_seqs: continue
+            self.conn.execute("""INSERT INTO resource_assignments(plan_id,step_no,resource_id,contact_name,contact_phone,
+                                 available_from,available_to,priority,state,created_at,updated_at)
+                                 VALUES(?,?,?,?,?,?,?,?,'allocated',?,?)""",
+                              (new_plan_id, row["step_no"], row["resource_id"], row["contact_name"], row["contact_phone"],
+                               row["available_from"], row["available_to"], row["priority"], now(), now()))
+            count += 1
+        return count
+
+    @staticmethod
+    def _parse_ts(value: str, label: str) -> datetime:
+        text = str(value or "").strip()
+        if not text: raise ApiError(400, f"{label or '时间'}不能为空")
+        try:
+            if text.endswith("Z"): text = text[:-1] + "+00:00"
+            parsed = datetime.fromisoformat(text)
+        except ValueError as exc: raise ApiError(400, f"{label or '时间'}格式应为 ISO 8601（如 2026-09-25T08:00:00Z）") from exc
+        if parsed.tzinfo is None: parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _fmt_ts(value: datetime) -> str:
+        return value.astimezone(timezone.utc).isoformat(timespec="minutes").replace("+00:00", "Z")
+
+    def _power_resource_dict(self, row: sqlite3.Row) -> dict:
+        used = self.conn.execute("""SELECT COUNT(*) FROM resource_assignments a JOIN plans p ON a.plan_id=p.id
+                                    WHERE a.resource_id=? AND p.state!='superseded' AND a.state='allocated'""", (row["id"],)).fetchone()[0]
+        return {"id": row["id"], "code": row["code"], "name": row["name"], "resource_type": row["resource_type"],
+                "capacity_mw": row["capacity_mw"], "owner": row["owner"], "region": row["region"],
+                "status": row["status"], "allocated_steps": used}
+
+    def _assignment_dict(self, row: sqlite3.Row) -> dict:
+        resource = self.conn.execute("SELECT * FROM power_resources WHERE id=?", (row["resource_id"],)).fetchone()
+        item = {"id": row["id"], "plan_id": row["plan_id"], "step_no": row["step_no"],
+                "resource_id": row["resource_id"], "resource_code": resource["code"] if resource else None,
+                "resource_name": resource["name"] if resource else None,
+                "contact_name": row["contact_name"], "contact_phone": row["contact_phone"],
+                "available_from": row["available_from"], "available_to": row["available_to"],
+                "priority": row["priority"], "state": row["state"]}
+        if row["state"] == "displaced":
+            occ = self.conn.execute("SELECT * FROM resource_assignments WHERE plan_id=? AND step_no=?",
+                                    (row["occupied_by_plan_id"], row["occupied_by_step_no"])).fetchone()
+            item["occupied_by"] = None if occ is None else {"plan_id": occ["plan_id"], "step_no": occ["step_no"],
+                                                            "resource_id": occ["resource_id"],
+                                                            "window": {"from": occ["available_from"], "to": occ["available_to"]}}
+            item["reassignable_windows"] = self._free_windows(row) if occ is not None else []
+        return item
+
+    def _free_windows(self, displaced: sqlite3.Row) -> list[dict]:
+        """被挤掉的排定：在其申请时段内，列出该电源仍可改派的空档。"""
+        want_from, want_to = self._parse_ts(displaced["available_from"], ""), self._parse_ts(displaced["available_to"], "")
+        blockers = []
+        for other in self.conn.execute("""SELECT a.* FROM resource_assignments a JOIN plans p ON a.plan_id=p.id
+                                         WHERE a.resource_id=? AND p.state!='superseded' AND a.state='allocated' AND a.id!=?""",
+                                       (displaced["resource_id"], displaced["id"])):
+            o_from, o_to = self._parse_ts(other["available_from"], ""), self._parse_ts(other["available_to"], "")
+            if want_from < o_to and o_from < want_to:
+                blockers.append((max(want_from, o_from), min(want_to, o_to),
+                                 {"plan_id": other["plan_id"], "step_no": other["step_no"]}))
+        blockers.sort(key=lambda x: x[0])
+        windows, cursor = [], want_from
+        for b_from, b_to, _meta in blockers:
+            if b_from > cursor: windows.append({"from": self._fmt_ts(cursor), "to": self._fmt_ts(b_from)})
+            if b_to > cursor: cursor = b_to
+        if cursor < want_to: windows.append({"from": self._fmt_ts(cursor), "to": self._fmt_ts(want_to)})
+        return windows
+
+
+        if int(expected_revision) != int(plan["revision"]): raise ApiError(409, "计划版本冲突")
+        with self.conn:
+            cur = self.conn.execute("UPDATE plans SET state=?,revision=revision+1 WHERE id=? AND revision=?", (state, plan["id"], expected_revision))
+            if cur.rowcount != 1: raise ApiError(409, "并发计划更新冲突")
+            self.store.audit(actor, action, "plan", plan["id"], details)
+
     def plan_detail(self, plan_id: int) -> dict:
         plan = self._plan_dict(self._row("plans", plan_id))
         return {"plan": plan, "confirmations": [dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? ORDER BY step_no", (plan_id,))],
+                "assignments": [self._assignment_dict(row) for row in self.conn.execute("SELECT * FROM resource_assignments WHERE plan_id=? ORDER BY step_no", (plan_id,))],
                 "field_reports": [dict(row) for row in self.conn.execute("SELECT * FROM field_reports WHERE plan_id=? ORDER BY id", (plan_id,))]}
 
     def _outage_dict(self, row: sqlite3.Row) -> dict:
@@ -323,10 +568,16 @@ class GridService:
                 "steps": json.loads(row["steps_json"]), "revision": row["revision"]}
 
     def state(self) -> dict:
+        outages = [self._outage_dict(row) for row in self.conn.execute("SELECT * FROM outages ORDER BY id DESC")]
+        for outage in outages:
+            latest = self.conn.execute("SELECT id FROM plans WHERE outage_id=? ORDER BY version DESC LIMIT 1", (outage["id"],)).fetchone()
+            outage["resource_ready"] = None if latest is None else self.resource_readiness(outage["id"], latest["id"])["ready"]
         return {"assets": [dict(row) for row in self.conn.execute("SELECT * FROM assets ORDER BY id")],
                 "facilities": [dict(row) for row in self.conn.execute("SELECT * FROM facilities ORDER BY priority,id")],
-                "outages": [self._outage_dict(row) for row in self.conn.execute("SELECT * FROM outages ORDER BY id DESC")],
+                "power_resources": [self._power_resource_dict(row) for row in self.conn.execute("SELECT * FROM power_resources ORDER BY id")],
+                "outages": outages,
                 "plans": [self._plan_dict(row) for row in self.conn.execute("SELECT * FROM plans ORDER BY id DESC")],
+                "assignments": [self._assignment_dict(row) for row in self.conn.execute("SELECT * FROM resource_assignments ORDER BY id")],
                 "telemetry_anomalies": [dict(row) for row in self.conn.execute("SELECT * FROM telemetry WHERE valid=0 ORDER BY id DESC LIMIT 20")],
                 "audits": [dict(row) for row in self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30")]}
 
@@ -335,6 +586,8 @@ class GridService:
             a = self.register_asset("dispatcher-demo", "dispatcher", "SUB-1", "中心站", "substation", 200, "城区")
             self.register_asset("dispatcher-demo", "dispatcher", "LINE-1", "一号线", "line", 120, "城区", a["id"])
             self.register_facility("dispatcher-demo", "dispatcher", "市医院", "hospital", a["id"], 1, 50)
+            self.register_power_resource("dispatcher-demo", "dispatcher", "GEN-M1", "移动发电车1号", "mobile_generator", 100,
+                                         "应急保障中心", "城区", "王工", "13800000001")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -343,6 +596,10 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: object) -> None: sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
     def _send(self, status: int, body: object) -> None:
         data = json.dumps(body, ensure_ascii=False).encode(); self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+    def _send_error(self, exc: ApiError) -> None:
+        body = {"error": exc.message}
+        if exc.details: body["details"] = exc.details
+        self._send(exc.status, body)
     def _body(self) -> dict:
         size = int(self.headers.get("Content-Length", "0"))
         try: return json.loads(self.rfile.read(size)) if size else {}
@@ -355,11 +612,16 @@ class Handler(BaseHTTPRequestHandler):
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
             elif len(p) == 3 and p[:2] == ["api", "plans"]: out = self.service.plan_detail(int(p[2]))
+            elif p == ["api", "resources"]:
+                out = {"resources": [self.service._power_resource_dict(row)
+                                     for row in self.service.conn.execute("SELECT * FROM power_resources ORDER BY id")]}
+            elif len(p) == 3 and p[:2] == ["api", "outages"] and p[2].isdigit():
+                out = self.service.resource_readiness(int(p[2]))
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
-        except ApiError as exc: self._send(exc.status, {"error": exc.message})
+        except ApiError as exc: self._send_error(exc)
         except Exception as exc: self._send(500, {"error": str(exc)})
 
     def do_POST(self) -> None:
@@ -367,6 +629,8 @@ class Handler(BaseHTTPRequestHandler):
             p, b = self._parts(), self._body(); actor, role = self.headers.get("X-Actor"), self.headers.get("X-Role")
             if p == ["api", "assets"]: out = self.service.register_asset(actor, role, b.get("code", ""), b.get("name", ""), b.get("asset_type", "line"), float(b.get("capacity_mw", 0)), b.get("region", ""), b.get("parent_id"))
             elif p == ["api", "facilities"]: out = self.service.register_facility(actor, role, b.get("name", ""), b.get("facility_type", "hospital"), int(b.get("asset_id", 0)), int(b.get("priority", 1)), float(b.get("backup_power_mw", 0)))
+            elif p == ["api", "resources"]: out = self.service.register_power_resource(actor, role, b.get("code", ""), b.get("name", ""), b.get("resource_type", "mobile_generator"), float(b.get("capacity_mw", 0)), b.get("owner", ""), b.get("region", ""), b.get("contact", ""), b.get("contact_phone", ""))
+            elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "assign-resource": out = self.service.assign_resource(actor, role, int(p[2]), int(b.get("step_no", 0)), int(b.get("resource_id", 0)), b.get("contact_name", ""), b.get("available_from", ""), b.get("available_to", ""), int(b.get("priority", 2)), int(b.get("expected_revision", -1)), b.get("contact_phone", ""))
             elif p == ["api", "outages"]: out = self.service.create_outage(actor, role, b.get("incident_code", ""), b.get("title", ""), b.get("affected_regions", []))
             elif p == ["api", "telemetry"]: out = self.service.record_telemetry(actor, role, int(b.get("asset_id", 0)), float(b.get("load_mw", 0)), float(b.get("voltage_kv", 0)), b.get("timestamp", ""))
             elif p == ["api", "plans"]: out = self.service.create_plan(actor, role, int(b.get("outage_id", 0)), b.get("steps", []))
@@ -379,7 +643,7 @@ class Handler(BaseHTTPRequestHandler):
             elif p == ["api", "status"]: out = self.service.publish_status(actor, role, int(b.get("outage_id", 0)), int(b.get("plan_id", 0)))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
-        except ApiError as exc: self._send(exc.status, {"error": exc.message})
+        except ApiError as exc: self._send_error(exc)
         except (ValueError, TypeError, sqlite3.IntegrityError) as exc: self._send(400, {"error": str(exc)})
         except Exception as exc: self._send(500, {"error": str(exc)})
 

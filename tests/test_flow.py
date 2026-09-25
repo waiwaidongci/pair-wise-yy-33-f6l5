@@ -20,7 +20,15 @@ class GridFlowTest(unittest.TestCase):
             {"seq": 2, "action": "送电", "asset": "LINE", "required_mw": 70, "depends_on": [1], "critical": True}])
         plan = self.s.submit_plan("dispatcher", "dispatcher", plan["id"], plan["revision"])
         plan = self.s.approve_plan("dispatcher", "dispatcher", plan["id"], plan["revision"], "安全校核通过")
-        return outage, self.s.activate_plan("dispatcher", "dispatcher", plan["id"], plan["revision"])
+        plan = self.s.activate_plan("dispatcher", "dispatcher", plan["id"], plan["revision"])
+        gen1 = self.s.register_power_resource("dispatcher", "dispatcher", f"GEN-{code}-1", "发电车1", "mobile_generator", 200, "应急中心", "A", "王工")
+        gen2 = self.s.register_power_resource("dispatcher", "dispatcher", f"GEN-{code}-2", "发电车2", "mobile_generator", 200, "应急中心", "A", "李工")
+        self.s.assign_resource("dispatcher", "dispatcher", plan["id"], 1, gen1["id"], "王工",
+                               "2000-01-01T00:00:00Z", "2099-01-01T00:00:00Z", 2, plan["revision"])
+        fresh = self.s._row("plans", plan["id"])
+        self.s.assign_resource("dispatcher", "dispatcher", plan["id"], 2, gen2["id"], "李工",
+                               "2000-01-01T00:00:00Z", "2099-01-01T00:00:00Z", 2, fresh["revision"])
+        return outage, self.s.plan_detail(plan["id"])["plan"]
 
     def test_full_restore_offline_merge_duplicate_and_plan_change(self):
         outage, plan = self.plan()

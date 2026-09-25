@@ -20,7 +20,10 @@ python3 app.py
 - `POST /api/plans/{id}/change`：在不修改已确认步骤的前提下创建新计划版本。
 - `POST /api/field-reports`：合并现场离线报告，重复客户端编号不会重复写入。
 - `POST /api/plans/{id}/confirm`：调度员确认步骤，依赖未满足时拒绝。
-- `POST /api/status`：发布当前恢复状态。
+- `POST /api/resources`：登记可借调备用电源（发电车、EPS 等）。
+- `POST /api/plans/{id}/assign-resource`：给步骤指定电源、联系人、可用起止时间和优先级（1 高/2 中/3 低），需带 `expected_revision`；已确认步骤拒绝换电，版本变化返回 409 提示重新加载。
+- `GET /api/outages/{id}`：按停电区域查看资源是否齐备及阻止原因；计划详情含每条排定的占用步骤与可改派空档。
+- `POST /api/status`：发布当前恢复状态；资源未齐备时拒绝并返回分区域阻止原因。
 - `GET /api/plans/{id}`、`GET /api/state`、`GET /api/health`：详情、状态和健康检查。
 
 ## 测试

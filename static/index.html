@@ -1,1 +1,17 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离和状态发布。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}.bad{color:#b00020;font-weight:600}.ok{color:#1b7f3b;font-weight:600}.card{border:1px solid #d8dde3;border-radius:8px;padding:12px 16px;margin:10px 0}</style>
+<h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、备用电源排定、离线上报合并、异常遥测隔离和状态发布。</p>
+<button onclick="loadState()">刷新状态</button>
+<div id="board"></div><pre id="state">加载中...</pre>
+<script>
+async function loadState(){
+  const s = await (await fetch('/api/state')).json();
+  state.textContent = JSON.stringify(s,null,2);
+  board.innerHTML = (s.outages||[]).map(o=>{
+    const ready = o.resource_ready===null ? '<span class="bad">尚无计划</span>'
+      : o.resource_ready ? '<span class="ok">资源齐备</span>' : '<span class="bad">资源未齐</span>';
+    const detail = o.resource_ready===false ? ` <a href="/api/outages/${o.id}" target="_blank">查看阻止原因</a>` : '';
+    return `<div class="card">事故 ${o.incident_code}（${(o.affected_regions||[]).join('、')||'—'}）：${ready}${detail}</div>`;
+  }).join('') + `<div class="card">已登记可借调电源 ${(s.power_resources||[]).length} 台；排定记录 ${(s.assignments||[]).length} 条</div>`;
+}
+loadState();
+</script></html>
